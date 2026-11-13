@@ -1,0 +1,346 @@
+/* =============================================
+-- Author: UNKNOWN
+-- Create Date: 23-07-2026
+-- Description: SP to get All Deliverable and task for download
+--
+-- Optimized version:
+--   * Optional id filters (@projectDeliverableIds, @parentProjectDeliverableIds,
+--     @projectDeliverableTaskIds) are applied INSIDE this SP, so only the
+--     required rows are built. When all three are NULL the behaviour is the
+--     same as before (full scope download).
+--   * Timesheet hours are pre-aggregated only for the needed deliverables/tasks.
+--   * soldHrs now uses each row's own projectScopeId (no CROSS APPLY over all scopes).
+--   * Unused timesheet aggregates removed.
+--
+ exec usp_downloadDeliverableByScopeIdV2 @projectScopeId='325592,325611', @loggedInUserId=1030
+ exec usp_downloadDeliverableByScopeIdV2 @projectScopeId=245605, @loggedInUserId=1030
+ exec usp_downloadDeliverableByScopeIdV2 @projectScopeId=325611, @loggedInUserId=6
+ exec usp_downloadDeliverableByScopeIdV2 @projectScopeId='304051,414199', @loggedInUserId=1030,
+      @projectDeliverableIds='507753,507744', @parentProjectDeliverableIds='771404',
+      @projectDeliverableTaskIds='583777,532814'
+-- =============================================
+*/
+CREATE OR ALTER PROCEDURE [dbo].[usp_downloadDeliverableByScopeIdV2]
+(
+    @projectScopeId              NVARCHAR(MAX),
+    @loggedInUserId              INT,
+    @languageCode                VARCHAR(5) = 'en',
+    @getDate                     DATETIME = NULL,
+    @projectDeliverableIds       NVARCHAR(MAX) = NULL,   -- optional filter
+    @parentProjectDeliverableIds NVARCHAR(MAX) = NULL,   -- optional filter
+    @projectDeliverableTaskIds   NVARCHAR(MAX) = NULL    -- optional filter
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DROP TABLE IF EXISTS #tempTable;
+    DROP TABLE IF EXISTS #deliverableIds;
+    DROP TABLE IF EXISTS #taskIds;
+    DROP TABLE IF EXISTS #ScopeIds;
+    DROP TABLE IF EXISTS #FilterDeliverableIds;
+    DROP TABLE IF EXISTS #FilterTaskIds;
+    DROP TABLE IF EXISTS #tsDelivIds;
+    DROP TABLE IF EXISTS #deliverableTs;
+    DROP TABLE IF EXISTS #taskTs;
+
+    ---------------------------------------------------------------------
+    -- Scope ids
+    ---------------------------------------------------------------------
+    CREATE TABLE #ScopeIds (projectScopeId INT PRIMARY KEY);
+
+    INSERT INTO #ScopeIds (projectScopeId)
+    SELECT DISTINCT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+    FROM STRING_SPLIT(COALESCE(@projectScopeId, ''), ',')
+    WHERE TRY_CAST(LTRIM(RTRIM(value)) AS INT) IS NOT NULL;
+
+    ---------------------------------------------------------------------
+    -- Which ids to build (optionally narrowed by dashboard filter ids)
+    ---------------------------------------------------------------------
+    DECLARE @useFilter BIT =
+        CASE WHEN @projectDeliverableIds       IS NULL
+              AND @parentProjectDeliverableIds IS NULL
+              AND @projectDeliverableTaskIds   IS NULL THEN 0 ELSE 1 END;
+
+    CREATE TABLE #FilterDeliverableIds (id INT PRIMARY KEY);
+    CREATE TABLE #FilterTaskIds        (id INT PRIMARY KEY);
+    CREATE TABLE #deliverableIds       (projectDeliverableId INT PRIMARY KEY);
+    CREATE TABLE #taskIds              (projectDeliverableTaskId INT PRIMARY KEY);
+
+    IF @useFilter = 1
+    BEGIN
+        -- deliverable ids + parent deliverable ids (UNION removes duplicates, PK is safe)
+        INSERT INTO #FilterDeliverableIds (id)
+        SELECT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+        FROM STRING_SPLIT(COALESCE(@projectDeliverableIds, ''), ',')
+        WHERE TRY_CAST(LTRIM(RTRIM(value)) AS INT) IS NOT NULL
+        UNION
+        SELECT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+        FROM STRING_SPLIT(COALESCE(@parentProjectDeliverableIds, ''), ',')
+        WHERE TRY_CAST(LTRIM(RTRIM(value)) AS INT) IS NOT NULL;
+
+        INSERT INTO #FilterTaskIds (id)
+        SELECT DISTINCT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+        FROM STRING_SPLIT(COALESCE(@projectDeliverableTaskIds, ''), ',')
+        WHERE TRY_CAST(LTRIM(RTRIM(value)) AS INT) IS NOT NULL;
+
+        INSERT INTO #deliverableIds (projectDeliverableId)
+        SELECT pd.projectDeliverableId
+        FROM tblProjectDeliverable pd
+        INNER JOIN #ScopeIds s            ON s.projectScopeId = pd.projectScopeId
+        INNER JOIN #FilterDeliverableIds f ON f.id = pd.projectDeliverableId
+        WHERE pd.isDeleted = 0;
+
+        -- Tasks matched by task id OR tasks sitting under a matched deliverable
+        -- (same behaviour as the old wrapper). If you only want the exact task
+        -- ids, delete the second SELECT below.
+        INSERT INTO #taskIds (projectDeliverableTaskId)
+        SELECT pdt.projectDeliverableTaskId
+        FROM tblProjectDeliverableTask pdt
+        INNER JOIN #ScopeIds s     ON s.projectScopeId = pdt.projectScopeId
+        INNER JOIN #FilterTaskIds f ON f.id = pdt.projectDeliverableTaskId
+        WHERE pdt.isDeleted = 0
+        UNION
+        SELECT pdt.projectDeliverableTaskId
+        FROM tblProjectDeliverableTask pdt
+        INNER JOIN #ScopeIds s            ON s.projectScopeId = pdt.projectScopeId
+        INNER JOIN #FilterDeliverableIds f ON f.id = pdt.projectDeliverableId
+        WHERE pdt.isDeleted = 0;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #deliverableIds (projectDeliverableId)
+        SELECT pd.projectDeliverableId
+        FROM tblProjectDeliverable pd
+        INNER JOIN #ScopeIds s ON s.projectScopeId = pd.projectScopeId
+        WHERE pd.isDeleted = 0;
+
+        INSERT INTO #taskIds (projectDeliverableTaskId)
+        SELECT pdt.projectDeliverableTaskId
+        FROM tblProjectDeliverableTask pdt
+        INNER JOIN #ScopeIds s ON s.projectScopeId = pdt.projectScopeId
+        WHERE pdt.isDeleted = 0;
+    END;
+
+    ---------------------------------------------------------------------
+    -- Timesheet pre-aggregation (only for the rows we actually need)
+    ---------------------------------------------------------------------
+    -- Deliverables needed + their children (children roll up into the parent)
+    CREATE TABLE #tsDelivIds (projectDeliverableId INT PRIMARY KEY);
+
+    INSERT INTO #tsDelivIds (projectDeliverableId)
+    SELECT projectDeliverableId FROM #deliverableIds
+    UNION
+    SELECT h.projectDeliverableId
+    FROM vw_projectDeliverableHierarchy h
+    INNER JOIN #ScopeIds s ON s.projectScopeId = h.projectScopeId
+    WHERE h.parentProjectDeliverableId IN (SELECT projectDeliverableId FROM #deliverableIds);
+
+    SELECT
+        ISNULL(CAST(h.parentProjectDeliverableId AS INT), h.projectDeliverableId) AS projectDeliverableId,
+        SUM(CASE WHEN t.statusCode IN (270, 280) THEN tf.noOfHoursFilled ELSE 0 END) AS actualTimesheetHours
+    INTO #deliverableTs
+    FROM tblTimeSheet t
+    INNER JOIN #tsDelivIds x                  ON x.projectDeliverableId = t.projectDeliverableId
+    INNER JOIN tblTimesheetFilled tf          ON tf.timesheetId = t.timesheetId
+    INNER JOIN vw_projectDeliverableHierarchy h ON h.projectDeliverableId = t.projectDeliverableId
+    WHERE t.isDeleted = 0
+    GROUP BY ISNULL(CAST(h.parentProjectDeliverableId AS INT), h.projectDeliverableId);
+
+    CREATE CLUSTERED INDEX IX_deliverableTs ON #deliverableTs (projectDeliverableId);
+
+    SELECT
+        t.projectDeliverableTaskId,
+        SUM(CASE WHEN t.statusCode IN (270, 280) THEN tf.noOfHoursFilled ELSE 0 END) AS actualTimesheetHours
+    INTO #taskTs
+    FROM tblTimeSheet t
+    INNER JOIN #taskIds ti           ON ti.projectDeliverableTaskId = t.projectDeliverableTaskId
+    INNER JOIN tblTimesheetFilled tf ON tf.timesheetId = t.timesheetId
+    WHERE t.isDeleted = 0
+    GROUP BY t.projectDeliverableTaskId;
+
+    CREATE CLUSTERED INDEX IX_taskTs ON #taskTs (projectDeliverableTaskId);
+
+    ---------------------------------------------------------------------
+    -- Main data: deliverables / sub-deliverables + tasks
+    ---------------------------------------------------------------------
+    SELECT
+        CASE WHEN pd.subDeliverableId IS NOT NULL THEN 'SD' ELSE 'D' END AS recordTypeShortName,
+        CASE WHEN pd.subDeliverableId IS NOT NULL THEN 'Sub-Deliverable' ELSE 'Deliverable' END AS recordType,
+        pd.projectScopeId,
+        pd.parentProjectDeliverableId,
+        pd.deliverableId,
+        pd.projectDeliverableId projectDeliverableId,
+        NULL AS projectDeliverableTaskId,
+        parentId,
+        CASE WHEN ISNULL(pd.DeliverableNo, '') = '' THEN CAST(pd.projectDeliverableId AS VARCHAR) ELSE pd.DeliverableNo END AS displayNo,
+        CASE
+            WHEN pd.subDeliverableId IS NULL THEN
+                CONCAT(
+                    CASE
+                        WHEN pd.subDeliverableId IS NOT NULL AND ISNULL(pd.isParentRevision, 0) > 0 THEN 'Rev - '
+                        WHEN pd.subDeliverableId IS NULL AND ISNULL(pd.isRevision, 0) > 0 THEN 'Rev - ' ELSE ''
+                    END
+                    ,
+                    COALESCE(dbo.udf_getTranslation(d.transJson, 'deliverableName', @languageCode), d.deliverableName)
+                    ,
+                    COALESCE(
+                        CASE
+                            WHEN pd.subdeliverableId IS NOT NULL AND COALESCE(pd.parentDeliverableDesc, '') <> '' THEN CONCAT(' | ', pd.parentDeliverableDesc)
+                            WHEN pd.subdeliverableId IS NULL AND COALESCE(pd.deliverableDesc, '') <> '' THEN CONCAT(' | ', pd.deliverableDesc)
+                            ELSE NULL
+                        END,
+                        ''
+                    )
+                )
+            ELSE
+                CONCAT(
+                    CASE
+                        WHEN ISNULL(pd.subDeliverableId, 0) = -99 AND ISNULL(pd.isRevision, 0) = 1 THEN 'Rev - Other - '
+                        WHEN ISNULL(pd.subDeliverableId, 0) = -99 AND ISNULL(pd.isRevision, 0) = 0 THEN 'Other - '
+                        WHEN ISNULL(pd.isRevision, 0) > 0 THEN 'Rev - '
+                        ELSE ''
+                    END
+                    ,
+                    CASE
+                        WHEN pd.subdeliverableId = -99 THEN pd.otherSubDeliverable
+                        ELSE COALESCE(dbo.udf_getTranslation(sd.transJson, 'deliverableName', @languageCode), sd.subDeliverableName)
+                    END
+                    ,
+                    COALESCE(CASE WHEN COALESCE(pd.deliverableDesc, '') <> '' THEN CONCAT(' | ', pd.deliverableDesc) ELSE NULL END, '')
+                )
+        END AS name,
+        me.employeeFullName ownerName,
+        COALESCE(dbo.udf_getTranslation(ss.transJson, 'statusName', @languageCode), ss.statusName) statusName,
+        pd.statusDate statusDate,
+        COALESCE(dbo.udf_getTranslation(mr.transJson, 'reasonText', @languageCode), mr.reasonText) AS reason,
+        pd.deliverableStartDate StartDate,
+        pd.deliverableCompletionDate plannedDate,
+        pd.deliverableCommittedDate committedDate,
+        pd.enggEstimatedHours enggEstHrs,
+        NULL OrgEstHrs,
+        STUFF((SELECT CONCAT(',', COALESCE(dbo.udf_getTranslation(pcc.transJson, 'costCode', @languageCode), pcc.costCode)
+                    , '-',
+                    COALESCE(dbo.udf_getTranslation(pcc.transJson, 'costCodeDescription', @languageCode), pcc.costCodeDescription))
+                FROM tblProjectDeliverableCostcode pdc
+                INNER JOIN mstCostCode pcc ON pcc.costCodeId = pdc.costcodeId
+                WHERE pdc.projectDeliverableId = pd.projectDeliverableId AND pdc.isDeleted = 0
+                FOR XML PATH('')
+            ), 1, 1, '') costCodeName,
+        STUFF((SELECT CONCAT(',', CAST(pdc.costCodeId AS VARCHAR))
+                FROM tblProjectDeliverableCostcode pdc
+                WHERE pdc.projectDeliverableId = pd.projectDeliverableId AND pdc.isDeleted = 0
+                FOR XML PATH('')
+            ), 1, 1, '') costCodeId,
+        pd.hourPercentage costCodePercentage,
+        COALESCE(dbo.udf_getTranslation(et.transJson, 'enggTeamName', @languageCode), et.enggTeamName) AS enggTeamName,
+        pd.isRevision isRevision,
+        NULL remainingHours,
+        -- NOTE: was CAST(... AS DECIMAL) (scale 0 => whole hours). Changed to (18,2)
+        -- to match task rows. Revert to DECIMAL if whole hours are really intended.
+        CAST(tsHours.actualTimesheetHours AS DECIMAL(18,2)) timesheetHours,
+        pd.projectDeliverableId AS keyIdentifier
+    INTO #tempTable
+    FROM vw_projectDeliverableHierarchy pd
+        INNER JOIN #deliverableIds pdids ON pdids.projectDeliverableId = pd.projectDeliverableId
+        INNER JOIN mstEnggTeam et        ON et.enggTeamId = pd.enggTeamId
+        LEFT JOIN mstDeliverable d       ON d.deliverableId = pd.deliverableId
+        LEFT JOIN mstSubDeliverable sd   ON sd.subDeliverableId = pd.subDeliverableId
+        LEFT JOIN mstEmployee me         ON me.empId = pd.deliveryLeadId
+        LEFT JOIN sysStatus ss           ON ss.statusCode = pd.statusCode
+        LEFT JOIN mstReason mr           ON mr.reasonId = pd.deliverableReasonId
+        LEFT JOIN #deliverableTs tsHours ON tsHours.projectDeliverableId = pd.projectDeliverableId
+
+    UNION ALL
+
+    SELECT
+        CASE WHEN pd.subDeliverableId IS NOT NULL THEN 'SDT' ELSE 'DT' END AS recordTypeShortName,
+        CASE WHEN pd.subDeliverableId IS NOT NULL THEN 'Sub-Deliverable >> Task' ELSE 'Deliverable >> Task' END AS recordType,
+        pd.projectScopeId,
+        NULL parentProjectDeliverableId,
+        pd.deliverableId,
+        pdt.projectDeliverableId projectDeliverableId,
+        pdt.projectDeliverableTaskId projectDeliverableTaskId,
+        pdt.parentId,
+        CASE WHEN ISNULL(pdt.TaskNo, '') = '' THEN CAST(pdt.projectDeliverableTaskId AS VARCHAR) ELSE pdt.TaskNo END AS displayNo,
+        CONCAT(
+            dbo.udf_GetTaskName(
+                COALESCE(dbo.udf_getTranslation(t.transJson, 'taskName', @languageCode), t.taskName),
+                pdt.customTaskName,
+                pdt.parentId,
+                pdt.isUnplannedTask,
+                pdt.isQualityCheckTask),
+            dbo.udf_GetTaskDescription(pdt.taskDescription, pdt.reworkSubCategoryId, 0)
+        ) AS [name],
+        me.employeeFullName ownerName,
+        COALESCE(dbo.udf_getTranslation(ss.transJson, 'statusName', @languageCode), ss.statusName) statusName,
+        pdt.statusDate statusDate,
+        COALESCE(dbo.udf_getTranslation(mr.transJson, 'reasonText', @languageCode), mr.reasonText) AS reason,
+        pdt.taskStartDate StartDate,
+        pdt.plannedDate plannedDate,
+        pdt.committedDate committedDate,
+        pdt.estimatedHours enggEstHrs,
+        NULL OrgEstHrs,
+        CONCAT(cc.costCode, ' - ', COALESCE(dbo.udf_getTranslation(cc.transJson, 'costCodeDescription', @languageCode), ISNULL(cc.costCodeDescription, ''))) costCodeName,
+        CAST(cc.costCodeId AS VARCHAR) costCodeId,
+        NULL costCodePercentage,
+        COALESCE(dbo.udf_getTranslation(et.transJson, 'enggTeamName', @languageCode), et.enggTeamName) AS enggTeamName,
+        NULL isRevision,
+        pdt.remainingHours remainingHours,
+        CAST(tsHours.actualTimesheetHours AS DECIMAL(18,2)) timesheetHours,
+        pdt.projectDeliverableTaskId AS keyIdentifier
+    FROM tblProjectDeliverableTask pdt
+        INNER JOIN #taskIds ids          ON ids.projectDeliverableTaskId = pdt.projectDeliverableTaskId
+        INNER JOIN tblProjectDeliverable pd ON pd.projectDeliverableId = pdt.projectDeliverableId
+        INNER JOIN mstEnggTeam et        ON et.enggTeamId = pd.enggTeamId
+        LEFT JOIN mstEmployee me         ON me.empId = pdt.empId
+        LEFT JOIN mstTask t              ON t.taskId = pdt.taskId
+        LEFT JOIN mstCostCode cc         ON cc.costCodeId = pdt.costCodeId
+        LEFT JOIN sysStatus ss           ON ss.statusCode = pdt.statusCode
+        LEFT JOIN mstReason mr           ON mr.reasonId = pdt.reasonId
+        LEFT JOIN #taskTs tsHours        ON tsHours.projectDeliverableTaskId = pdt.projectDeliverableTaskId;
+
+    ---------------------------------------------------------------------
+    -- Sold hours (per row's own scope; no CROSS APPLY over all scopes)
+    ---------------------------------------------------------------------
+    ALTER TABLE #tempTable ADD soldHrs DECIMAL(18,2);
+
+    UPDATE T
+    SET soldHrs = ISNULL(X.orgEstHrs, 0)
+    FROM #tempTable T
+    OUTER APPLY
+    (
+        SELECT SUM(A.orgEstimatedHours) AS orgEstHrs
+        FROM dbo.udf_getCostCodeUtilizationAndOrgEstHr
+        (
+            T.projectScopeId,
+            T.deliverableId,
+            T.costCodeId,
+            T.costCodePercentage,
+            @loggedInUserId,
+            0,
+            NULL
+        ) A
+    ) X
+    WHERE T.recordTypeShortName = 'D';
+
+    ---------------------------------------------------------------------
+    -- Result
+    ---------------------------------------------------------------------
+    SELECT
+        recordTypeShortName, recordType, projectScopeId, parentProjectDeliverableId, projectDeliverableId,
+        projectDeliverableTaskId, parentId, displayNo, name, ownerName, statusName, statusDate,
+        reason, StartDate, plannedDate, committedDate, enggEstHrs, soldHrs AS orgEstHrs, costCodeName,
+        costCodePercentage, enggTeamName, isRevision, remainingHours, timesheetHours, keyIdentifier
+    FROM #tempTable;
+
+    DROP TABLE IF EXISTS #tempTable;
+    DROP TABLE IF EXISTS #deliverableIds;
+    DROP TABLE IF EXISTS #taskIds;
+    DROP TABLE IF EXISTS #ScopeIds;
+    DROP TABLE IF EXISTS #FilterDeliverableIds;
+    DROP TABLE IF EXISTS #FilterTaskIds;
+    DROP TABLE IF EXISTS #tsDelivIds;
+    DROP TABLE IF EXISTS #deliverableTs;
+    DROP TABLE IF EXISTS #taskTs;
+END
