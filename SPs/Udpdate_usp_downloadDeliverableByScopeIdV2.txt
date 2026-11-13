@@ -3,21 +3,30 @@
 -- Create Date: 23-07-2026
 -- Description: SP to get All Deliverable and task for download
 --
--- Optimized version:
+-- Optimized + paged version:
 --   * Optional id filters (@projectDeliverableIds, @parentProjectDeliverableIds,
---     @projectDeliverableTaskIds) are applied INSIDE this SP, so only the
---     required rows are built. When all three are NULL the behaviour is the
---     same as before (full scope download).
---   * Timesheet hours are pre-aggregated only for the needed deliverables/tasks.
---   * soldHrs now uses each row's own projectScopeId (no CROSS APPLY over all scopes).
---   * Unused timesheet aggregates removed.
+--     @projectDeliverableTaskIds) are applied inside this SP.
+--   * Optional pagination (@pageNumber, @pageSize). Paging is applied to the
+--     lightweight id lists BEFORE the expensive work (translations, timesheets,
+--     soldHrs), so only the rows of the requested page are fully built.
+--   * @totalRecord (OUTPUT) returns the total number of rows (deliverables +
+--     sub-deliverables + tasks) before paging.
+--   * If @pageNumber or @pageSize is NULL/<1, no paging: all rows are returned
+--     (existing callers are unaffected). @totalRecord is still filled.
+--   * Rows are returned in a stable order:
+--       projectScopeId, projectDeliverableId, deliverable row first then its tasks, task id.
 --
+ -- Full scope download (old behaviour)
  exec usp_downloadDeliverableByScopeIdV2 @projectScopeId='325592,325611', @loggedInUserId=1030
- exec usp_downloadDeliverableByScopeIdV2 @projectScopeId=245605, @loggedInUserId=1030
- exec usp_downloadDeliverableByScopeIdV2 @projectScopeId=325611, @loggedInUserId=6
- exec usp_downloadDeliverableByScopeIdV2 @projectScopeId='304051,414199', @loggedInUserId=1030,
+
+ -- Paged, with filter ids, reading total
+ DECLARE @total INT;
+ exec usp_downloadDeliverableByScopeIdV2
+      @projectScopeId='304051,414199', @loggedInUserId=1030,
       @projectDeliverableIds='507753,507744', @parentProjectDeliverableIds='771404',
-      @projectDeliverableTaskIds='583777,532814'
+      @projectDeliverableTaskIds='583777,532814',
+      @pageNumber=1, @pageSize=100, @totalRecord=@total OUTPUT;
+ SELECT @total AS totalRecord;
 -- =============================================
 */
 CREATE OR ALTER PROCEDURE [dbo].[usp_downloadDeliverableByScopeIdV2]
@@ -28,7 +37,10 @@ CREATE OR ALTER PROCEDURE [dbo].[usp_downloadDeliverableByScopeIdV2]
     @getDate                     DATETIME = NULL,
     @projectDeliverableIds       NVARCHAR(MAX) = NULL,   -- optional filter
     @parentProjectDeliverableIds NVARCHAR(MAX) = NULL,   -- optional filter
-    @projectDeliverableTaskIds   NVARCHAR(MAX) = NULL    -- optional filter
+    @projectDeliverableTaskIds   NVARCHAR(MAX) = NULL,   -- optional filter
+    @pageNumber                  INT = NULL,             -- 1-based; NULL = no paging
+    @pageSize                    INT = NULL,             -- NULL = no paging
+    @totalRecord                 INT = NULL OUTPUT       -- total rows before paging
 )
 AS
 BEGIN
@@ -40,6 +52,7 @@ BEGIN
     DROP TABLE IF EXISTS #ScopeIds;
     DROP TABLE IF EXISTS #FilterDeliverableIds;
     DROP TABLE IF EXISTS #FilterTaskIds;
+    DROP TABLE IF EXISTS #pageKeys;
     DROP TABLE IF EXISTS #tsDelivIds;
     DROP TABLE IF EXISTS #deliverableTs;
     DROP TABLE IF EXISTS #taskTs;
@@ -55,7 +68,7 @@ BEGIN
     WHERE TRY_CAST(LTRIM(RTRIM(value)) AS INT) IS NOT NULL;
 
     ---------------------------------------------------------------------
-    -- Which ids to build (optionally narrowed by dashboard filter ids)
+    -- Which ids to build (optionally narrowed by filter ids)
     ---------------------------------------------------------------------
     DECLARE @useFilter BIT =
         CASE WHEN @projectDeliverableIds       IS NULL
@@ -87,23 +100,22 @@ BEGIN
         INSERT INTO #deliverableIds (projectDeliverableId)
         SELECT pd.projectDeliverableId
         FROM tblProjectDeliverable pd
-        INNER JOIN #ScopeIds s            ON s.projectScopeId = pd.projectScopeId
+        INNER JOIN #ScopeIds s             ON s.projectScopeId = pd.projectScopeId
         INNER JOIN #FilterDeliverableIds f ON f.id = pd.projectDeliverableId
         WHERE pd.isDeleted = 0;
 
-        -- Tasks matched by task id OR tasks sitting under a matched deliverable
-        -- (same behaviour as the old wrapper). If you only want the exact task
-        -- ids, delete the second SELECT below.
+        -- Tasks matched by task id OR tasks sitting under a matched deliverable.
+        -- If you only want the exact task ids, delete the second SELECT below.
         INSERT INTO #taskIds (projectDeliverableTaskId)
         SELECT pdt.projectDeliverableTaskId
         FROM tblProjectDeliverableTask pdt
-        INNER JOIN #ScopeIds s     ON s.projectScopeId = pdt.projectScopeId
+        INNER JOIN #ScopeIds s      ON s.projectScopeId = pdt.projectScopeId
         INNER JOIN #FilterTaskIds f ON f.id = pdt.projectDeliverableTaskId
         WHERE pdt.isDeleted = 0
         UNION
         SELECT pdt.projectDeliverableTaskId
         FROM tblProjectDeliverableTask pdt
-        INNER JOIN #ScopeIds s            ON s.projectScopeId = pdt.projectScopeId
+        INNER JOIN #ScopeIds s             ON s.projectScopeId = pdt.projectScopeId
         INNER JOIN #FilterDeliverableIds f ON f.id = pdt.projectDeliverableId
         WHERE pdt.isDeleted = 0;
     END
@@ -120,6 +132,52 @@ BEGIN
         FROM tblProjectDeliverableTask pdt
         INNER JOIN #ScopeIds s ON s.projectScopeId = pdt.projectScopeId
         WHERE pdt.isDeleted = 0;
+    END;
+
+    ---------------------------------------------------------------------
+    -- Total record count (before paging)
+    ---------------------------------------------------------------------
+    SET @totalRecord = (SELECT COUNT(*) FROM #deliverableIds)
+                     + (SELECT COUNT(*) FROM #taskIds);
+
+    ---------------------------------------------------------------------
+    -- Pagination on the lightweight id lists (before the expensive work)
+    ---------------------------------------------------------------------
+    IF @pageNumber IS NOT NULL AND @pageSize IS NOT NULL
+       AND @pageNumber >= 1 AND @pageSize >= 1
+    BEGIN
+        DECLARE @offset INT = (@pageNumber - 1) * @pageSize;
+
+        -- rt: 0 = deliverable / sub-deliverable row, 1 = task row
+        CREATE TABLE #pageKeys (rt TINYINT NOT NULL, id INT NOT NULL, PRIMARY KEY (rt, id));
+
+        INSERT INTO #pageKeys (rt, id)
+        SELECT k.rt, k.id
+        FROM
+        (
+            SELECT 0 AS rt, pd.projectScopeId AS sc, pd.projectDeliverableId AS did,
+                   0 AS tid, pd.projectDeliverableId AS id
+            FROM tblProjectDeliverable pd
+            INNER JOIN #deliverableIds i ON i.projectDeliverableId = pd.projectDeliverableId
+
+            UNION ALL
+
+            SELECT 1, pdt.projectScopeId, pdt.projectDeliverableId,
+                   pdt.projectDeliverableTaskId, pdt.projectDeliverableTaskId
+            FROM tblProjectDeliverableTask pdt
+            INNER JOIN #taskIds i ON i.projectDeliverableTaskId = pdt.projectDeliverableTaskId
+        ) k
+        ORDER BY k.sc, k.did, k.rt, k.tid
+        OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;
+
+        -- keep only the ids of the requested page
+        DELETE d
+        FROM #deliverableIds d
+        WHERE NOT EXISTS (SELECT 1 FROM #pageKeys k WHERE k.rt = 0 AND k.id = d.projectDeliverableId);
+
+        DELETE t
+        FROM #taskIds t
+        WHERE NOT EXISTS (SELECT 1 FROM #pageKeys k WHERE k.rt = 1 AND k.id = t.projectDeliverableTaskId);
     END;
 
     ---------------------------------------------------------------------
@@ -141,8 +199,8 @@ BEGIN
         SUM(CASE WHEN t.statusCode IN (270, 280) THEN tf.noOfHoursFilled ELSE 0 END) AS actualTimesheetHours
     INTO #deliverableTs
     FROM tblTimeSheet t
-    INNER JOIN #tsDelivIds x                  ON x.projectDeliverableId = t.projectDeliverableId
-    INNER JOIN tblTimesheetFilled tf          ON tf.timesheetId = t.timesheetId
+    INNER JOIN #tsDelivIds x                    ON x.projectDeliverableId = t.projectDeliverableId
+    INNER JOIN tblTimesheetFilled tf            ON tf.timesheetId = t.timesheetId
     INNER JOIN vw_projectDeliverableHierarchy h ON h.projectDeliverableId = t.projectDeliverableId
     WHERE t.isDeleted = 0
     GROUP BY ISNULL(CAST(h.parentProjectDeliverableId AS INT), h.projectDeliverableId);
@@ -290,18 +348,18 @@ BEGIN
         CAST(tsHours.actualTimesheetHours AS DECIMAL(18,2)) timesheetHours,
         pdt.projectDeliverableTaskId AS keyIdentifier
     FROM tblProjectDeliverableTask pdt
-        INNER JOIN #taskIds ids          ON ids.projectDeliverableTaskId = pdt.projectDeliverableTaskId
+        INNER JOIN #taskIds ids             ON ids.projectDeliverableTaskId = pdt.projectDeliverableTaskId
         INNER JOIN tblProjectDeliverable pd ON pd.projectDeliverableId = pdt.projectDeliverableId
-        INNER JOIN mstEnggTeam et        ON et.enggTeamId = pd.enggTeamId
-        LEFT JOIN mstEmployee me         ON me.empId = pdt.empId
-        LEFT JOIN mstTask t              ON t.taskId = pdt.taskId
-        LEFT JOIN mstCostCode cc         ON cc.costCodeId = pdt.costCodeId
-        LEFT JOIN sysStatus ss           ON ss.statusCode = pdt.statusCode
-        LEFT JOIN mstReason mr           ON mr.reasonId = pdt.reasonId
-        LEFT JOIN #taskTs tsHours        ON tsHours.projectDeliverableTaskId = pdt.projectDeliverableTaskId;
+        INNER JOIN mstEnggTeam et           ON et.enggTeamId = pd.enggTeamId
+        LEFT JOIN mstEmployee me            ON me.empId = pdt.empId
+        LEFT JOIN mstTask t                 ON t.taskId = pdt.taskId
+        LEFT JOIN mstCostCode cc            ON cc.costCodeId = pdt.costCodeId
+        LEFT JOIN sysStatus ss              ON ss.statusCode = pdt.statusCode
+        LEFT JOIN mstReason mr              ON mr.reasonId = pdt.reasonId
+        LEFT JOIN #taskTs tsHours           ON tsHours.projectDeliverableTaskId = pdt.projectDeliverableTaskId;
 
     ---------------------------------------------------------------------
-    -- Sold hours (per row's own scope; no CROSS APPLY over all scopes)
+    -- Sold hours (per row's own scope; only for the rows of this page)
     ---------------------------------------------------------------------
     ALTER TABLE #tempTable ADD soldHrs DECIMAL(18,2);
 
@@ -325,14 +383,19 @@ BEGIN
     WHERE T.recordTypeShortName = 'D';
 
     ---------------------------------------------------------------------
-    -- Result
+    -- Result (stable order so pages never overlap)
     ---------------------------------------------------------------------
     SELECT
         recordTypeShortName, recordType, projectScopeId, parentProjectDeliverableId, projectDeliverableId,
         projectDeliverableTaskId, parentId, displayNo, name, ownerName, statusName, statusDate,
         reason, StartDate, plannedDate, committedDate, enggEstHrs, soldHrs AS orgEstHrs, costCodeName,
         costCodePercentage, enggTeamName, isRevision, remainingHours, timesheetHours, keyIdentifier
-    FROM #tempTable;
+    FROM #tempTable
+    ORDER BY
+        projectScopeId,
+        projectDeliverableId,
+        CASE WHEN projectDeliverableTaskId IS NULL THEN 0 ELSE 1 END,
+        projectDeliverableTaskId;
 
     DROP TABLE IF EXISTS #tempTable;
     DROP TABLE IF EXISTS #deliverableIds;
@@ -340,6 +403,7 @@ BEGIN
     DROP TABLE IF EXISTS #ScopeIds;
     DROP TABLE IF EXISTS #FilterDeliverableIds;
     DROP TABLE IF EXISTS #FilterTaskIds;
+    DROP TABLE IF EXISTS #pageKeys;
     DROP TABLE IF EXISTS #tsDelivIds;
     DROP TABLE IF EXISTS #deliverableTs;
     DROP TABLE IF EXISTS #taskTs;
