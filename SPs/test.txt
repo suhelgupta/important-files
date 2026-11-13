@@ -1,1 +1,244 @@
-hi
+--usp_getProjectScopeDetailsForDashboardV2 @empIds ='13',@IsMySelf = 1 ,@loggedInUserId=13 ,@isDeliverable = 1, @otdStatus='Late'          
+CREATE   procedure usp_getProjectScopeDetailsForDashboardV2 (          
+    @empIds NVARCHAR(MAX),              
+    @StartDate DATETIME = NULL,              
+    @EndDate DATETIME = NULL,              
+    @IsMySelf BIT = NULL,              
+    @EnggTeamIds NVARCHAR(MAX) = NULL,              
+    @loggedInUserId INT = NULL,              
+    @languageCode VARCHAR(5) = 'en',              
+    @getDate DATETIME = NULL  ,          
+ @otdStatus NVARCHAR(MAX) = NULL ,          
+ @isDeliverable BIT = NULL          
+)          
+AS          
+BEGIN          
+SET NOCOUNT ON             
+          
+        
+DECLARE @New INT = 406;          
+DECLARE @NoEngineering INT = 405;          
+DECLARE @WIP INT = 407;          
+DECLARE @OnHold INT = 300;          
+              
+    IF (@getDate IS NULL)              
+        SET @getDate = GETDATE();              
+              
+              
+    IF OBJECT_ID('tempdb..#EmpIdList') IS NOT NULL              
+        DROP TABLE #EmpIdList;              
+              
+    IF OBJECT_ID('tempdb..#EnggTeamList') IS NOT NULL              
+        DROP TABLE #EnggTeamList;              
+              
+    IF (@StartDate IS NULL)              
+        SET @StartDate = CAST(@getDate AS DATE);              
+              
+    IF (@EndDate IS NULL)              
+        SET @EndDate = DATEADD(DAY, 7, @StartDate);              
+              
+    -------------------------------------------------------------------              
+    -- My Self Filter              
+    -------------------------------------------------------------------              
+    IF (@IsMySelf = 1)              
+    BEGIN              
+        SET @empIds = CAST(@loggedInUserId AS NVARCHAR(MAX));              
+    END              
+    ELSE              
+    BEGIN              
+              
+        -------------------------------------------------------------------              
+        -- Get Engineering Teams              
+        -------------------------------------------------------------------              
+        IF (@EnggTeamIds = '-1' OR @EnggTeamIds IS NULL)              
+        BEGIN              
+              
+            DECLARE @EnggTeamIdsTable TABLE              
+            (              
+                empId INT,              
+                empName NVARCHAR(100),              
+                enggTeamId INT,              
+                enggTeamName NVARCHAR(100),              
+                enggRegionId INT,              
+                enggRegionName NVARCHAR(MAX),              
+                geographyId INT,              
+                geographyName NVARCHAR(100),              
+                buId INT,              
+                buName NVARCHAR(100),              
+                parentbuId INT,              
+                parentBuName NVARCHAR(MAX)              
+            );              
+              
+            INSERT INTO @EnggTeamIdsTable              
+            (              
+                empId,              
+                empName,              
+                enggTeamId,              
+                enggTeamName,              
+                enggRegionId,              
+                enggRegionName,              
+                geographyId,              
+                geographyName,              
+                buId,              
+                buName,              
+                parentbuId,              
+                parentBuName              
+            )              
+            EXEC usp_getMyEnggTeamDetails              
+                @empId = @loggedInUserId,              
+                @type = 'F',              
+                @buId = NULL,              
+                @enggRegionId = NULL,              
+                @geographyId = NULL,              
+                @languageCode = @languageCode;              
+              
+            SELECT @EnggTeamIds =              
+                STRING_AGG(CAST(enggTeamId AS NVARCHAR(MAX)), ',')              
+            FROM              
+            (              
+                SELECT DISTINCT enggTeamId              
+                FROM @EnggTeamIdsTable              
+            ) A;               
+              
+        END;              
+              
+        -------------------------------------------------------------------              
+        -- Get Employees From Selected Teams              
+        -------------------------------------------------------------------              
+        IF (@empIds = '-1' OR @empIds IS NULL)              
+        BEGIN              
+              
+            DECLARE @EmpIdsTable TABLE              
+            (              
+                mapEnggTeamEmpId INT,              
+                enggTeamId INT,              
+                enggTeamName NVARCHAR(100),              
+                EmpId INT,              
+                teamMemberName NVARCHAR(100),              
+                isOwner BIT,              
+                isDefaultTeamLead BIT              
+            );              
+              
+            INSERT INTO @EmpIdsTable              
+            (              
+                mapEnggTeamEmpId,              
+                enggTeamId,              
+                enggTeamName,              
+                EmpId,              
+                teamMemberName,              
+                isOwner,              
+                isDefaultTeamLead              
+            )              
+            EXEC usp_getTeamMembersOfEnggTeams              
+                @enggTeamIdList = @EnggTeamIds,              
+                @loggedInUserId = @loggedInUserId,              
+                @type = 'F';              
+              
+            SELECT @empIds =              
+                STRING_AGG(CAST(EmpId AS NVARCHAR(MAX)), ',')              
+            FROM              
+            (              
+                SELECT DISTINCT EmpId              
+                FROM @EmpIdsTable              
+            ) A;              
+              
+        END;              
+              
+    END;              
+              
+    -------------------------------------------------------------------              
+    -- Employee List              
+    -------------------------------------------------------------------              
+    CREATE TABLE #EmpIdList              
+    (              
+        EmpId INT              
+    );              
+              
+    INSERT INTO #EmpIdList (EmpId)              
+    SELECT CAST(TRIM(value) AS INT)              
+    FROM STRING_SPLIT(@empIds, ',')              
+    WHERE TRIM(value) <> ''          
+          
+          
+ SELECT DISTINCT          
+    p.projectId,          
+    p.projectName,          
+    p.projectNo,          
+    ps.projectScopeId,          
+    pf.productFamilyName,          
+    pf.productFamilyCode,      
+    pd.projectDeliverableId,      
+    pd.parentProjectDeliverableId,      
+    pdt.projectDeliverableTaskId      
+FROM vw_projectDeliverableHierarchy pd        
+INNER JOIN tblProject p        
+    ON p.projectId = pd.projectId        
+INNER JOIN tblProjectScope ps        
+    ON ps.projectScopeId = pd.projectScopeId        
+LEFT JOIN tblProjectDeliverableTask pdt        
+    ON pdt.projectDeliverableId = pd.projectDeliverableId        
+INNER JOIN mstProductFamily pf          
+    ON pf.productFamilyId = ps.productFamilyId          
+WHERE        
+    ISNULL(pd.isDeleted, 0) = 0            
+    AND        
+    (        
+        (        
+            @isDeliverable = 1        
+            AND pd.deliveryLeadId IN (SELECT EmpId FROM #EmpIdList)        
+            AND CAST(pd.deliverableCommittedDate AS DATE) <= CAST(@EndDate AS DATE)        
+            AND        
+            (        
+                (@otdStatus = 'New' AND pd.statusCode IN (406,362))        
+                OR        
+                (        
+                    @otdStatus <> 'New'        
+                    AND dbo.GetOTDStatus(        
+                        pd.statusCode,        
+                        pd.statusDate,        
+                        pd.deliveredDate,        
+                        pd.deliverableCommittedDate,        
+                        CAST(@getDate AS DATE),        
+                        pd.deliveryLeadId        
+                    ) = @otdStatus        
+                )        
+            )        
+  )        
+        OR        
+        (        
+            @isDeliverable = 0    
+    AND ISNULL(pdt.isDeleted, 0) = 0    
+            AND pdt.empId IN (SELECT EmpId FROM #EmpIdList)        
+            AND CAST(pdt.committedDate AS DATE) <= CAST(@EndDate AS DATE)        
+            AND        
+            (        
+                (@otdStatus = 'New' AND pdt.statusCode IN (406,362))        
+                OR        
+                (        
+                    @otdStatus <> 'New'        
+                    AND dbo.GetOTDStatus(        
+                        pdt.statusCode,        
+                        pdt.statusDate,        
+                        pdt.deliveredDate,        
+                        pdt.committedDate,        
+                        CAST(@getDate AS DATE),        
+                        pdt.empId        
+                    ) = @otdStatus        
+                )        
+            )        
+        )        
+        OR        
+        (        
+            @isDeliverable IS NULL        
+            AND ISNULL(@otdStatus,'') = ''        
+            AND        
+            (        
+                pd.deliveryLeadId IN (SELECT EmpId FROM #EmpIdList)        
+                OR pdt.empId IN (SELECT EmpId FROM #EmpIdList)        
+            )        
+        )        
+    );        
+        
+END   
+  
+  
